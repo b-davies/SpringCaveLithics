@@ -1,0 +1,451 @@
+---
+title: "Spring Cave Lens Clock/Cortex Ratio Analysis"
+author: "Ben Davies"
+date: "July 6, 2021"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+#Step 1: Load packages
+```{r}
+require(tidyverse)
+require(ggExtra)
+require(gridExtra)
+require(cowplot)
+require(gtable)
+require(gridExtra)
+```
+
+
+#Step 2: Load data
+```{r}
+sc<-read.csv("SPRING_CAVE_LITHICS.csv") #read in lithic measurement data
+sc<-sc[complete.cases(sc[,8:11]), ] #eliminate incomplete cases
+sc<-subset(sc,MATERIAL=="QUARTZ") #subset to quartz data
+sc_s<-read.csv("S_VALUES_SC.csv") #read in lens clock data
+counts<-table(sc_s$ARTID)  #subset to data with >5 readings
+more5<-names(counts[counts>5])
+sc_s<-subset(sc_s,ARTID %in% more5)
+
+#List layer names to be used in analysis
+sc_assemblages<-c("sc_pre3000","sc_post1000")
+pre3000<-c("NEXT BLACK I","ALL BLACK","BLACK MIDDEN","BBM","BELOW BLACK MIDDEN","BELOW BM UNDER ROCK","UDF","UDF2","NEXT BLACK 2","NB3")
+post1000<-c("MIDDEN ECHO","DARK BROWN MIDDEN","MIDDEN ALPHA","MIDDEN BRAVO","MIDDEN CHARLIE","MIDDEN DELTA","DARK LOAM WITH SHELL","SOIL WITH SHELL","ASH 4","ORGANIC LOAM 1","SHELLY LOAM","HBSL","VOL","HBOL","YELLOW MIDDEN","ORGANIC MIDDEN","ORGANIC MIDDEN 2","DARK MIDDEN","DARK MIDDEN 2","ASH 4","ORGANIC LOAM 1","SHELLY LOAM","HBSL","VOL","HBOL","YELLOW MIDDEN","ORGANIC MIDDEN","ORGANIC MIDDEN 2","DARK MIDDEN","DARK MIDDEN 2","SURFACE","ASH 1","ASH 2","ASH 3")
+dunno<-c("NEXT BLACK 4","BROWN SOIL ABOVE BEDROCK","ROOTS","GRASS", "MIDDEN FOXTROT")
+
+#subset data to those from layers
+sc_pre3000<-subset(sc,VUNIT %in% pre3000)
+sc_post1000<-subset(sc,VUNIT %in% post1000)
+sc_dunno<-subset(sc, VUNIT %in% dunno)
+
+
+```
+
+#Step 3: Get average nodule volume from S & Y values
+```{r}
+#get unique cortical fragements used for lens clock analysis
+uvals<-unique(sc_s$ARTID)
+rads<-c()
+#for each fragment calculate the radius estimate from curvature
+for (i in uvals){
+  sub_s<-subset(sc_s,ARTID==i)
+  if (length(sub_s[,1])>5){
+  s<-mean(sub_s$S) #use mean of lens clock readings for fragment
+  y<-sub_s[1,2]/2
+  sy<-c(s,y)
+  r<-(sy[2]^2)/(2*sy[1])+(sy[1]/2) #calculate theoretical nodule radius from S and Y
+  rads<-append(rads,r)
+  }
+}
+vols<-c()
+#for each radius estimate, calculate an estimated nodule volume
+for (j in rads){
+  theo_vol<-((4/3)*pi*j^3)/1000 
+  vols<-append(vols,theo_vol)
+}
+#use the median volume estimate as the reconstructed nodule volume and calculate surface area from that
+sc_av_nod_vol<-median(vols)
+sc_av_nod_csa<-(pi^(1/3)*(6*sc_av_nod_vol)^(2/3))*100
+
+```
+
+
+#Step 4: Get cortex ratios
+```{r}
+
+#Empty vectors for cortex ratio, volume, expected surface area, observed surface area, and number of fragments
+sc_cortex_ratios<-c()
+sc_vols<-c()
+sc_expsa<-c()
+sc_obsa<-c()
+sc_n<-c()
+#for each assemblage
+for (i in sc_assemblages){
+  #pull in assemblage
+  assemblage<-get(i)
+  #get n
+  sc_n<-append(sc_n,length(assemblage[,1]))
+  #get the assemblage volume from assemblage weight / specific gravity of quartz (2.65)
+  sumweight<-sum(assemblage$WEIGHT,na.rm=TRUE)
+  assem_vol<-sumweight/2.65
+  sc_vols<-append(sc_vols,assem_vol)
+  #estimate how much surface area there should be for an assemblage made from the "average nodule"
+  exp_csa<-(assem_vol/sc_av_nod_vol)*sc_av_nod_csa
+  sc_expsa<-append(sc_expsa,exp_csa)
+  #sum the amount of cortical surface present to get the observed cortical surface
+  assem_csa<-sum((assemblage$MAXLENGTH*assemblage$MAXWIDTH)*(assemblage$CORTEX/100))
+  sc_obsa<-append(sc_obsa,assem_csa)
+  #divide observed by expected to get cortex ratio
+  sc_cortex_ratios<-append(sc_cortex_ratios,(assem_csa/exp_csa))
+}
+#Print cortex ratios for >3k BP and <1k BP
+print(sc_cortex_ratios)
+
+```
+
+#Step 5: Functions to assess Spring Cave cortex ratios using experimental data
+```{r}
+#read in experimental data
+hrq_cobbles<-read.csv("hrq_cobbles.csv",stringsAsFactors = FALSE)
+hrq_frag<-read.csv("hrq_fragments.csv",stringsAsFactors = FALSE)
+hrq_whole<-read.csv("hrq_s_whole.csv",stringsAsFactors = FALSE)
+hrq_frag_s<-read.csv("hrq_s_fragments.csv",stringsAsFactors = FALSE)
+
+#The following functions originally come from 
+#Douglass M, Davies B, Braun DR, et al (2021) Deriving original nodule size of lithic reduction sets from cortical #curvature: An application to monitor stone artifact transport from bipolar reduction. Journal of Archaeological #Science: Reports 35:102671. https://doi.org/10.1016/j.jasrep.2020.102671
+
+#Function to bootstrap sample from experimental datasets
+
+#NOTE: The original study assessed how different processes contributing to manufacture and artefact selection could #be detected using the lens clock method. Here, we use it only to generate whole assemblages with nothing #removed/added.
+
+#data = dataframe of values from s2_frag
+#size = integer, number of fragments to include in assemblage (default 10000)
+#augment = Either "no", "add", "remove"
+#percent = floating point value between 0 and 1
+#criteria = Either "none", length", "flake_only", "flake_long", or "cortical"
+makeAssemblage<-function(data,size,augment,percent,criteria){
+  cobbles<-sort(unique(data[,2])) #get unique original cobble numbers
+  start_cob<-sample(cobbles,1)  #pick a random first cobble
+  assemblage<-subset(data,CobbleID == start_cob) #start simulated assemblage using products from first cobble
+  while (length(assemblage[,1])<size){ #repeat (with replacement) until assemblage is of desired size
+    add_cob<-sample(cobbles,1)
+    assemblage<-rbind(assemblage,subset(data,CobbleID == add_cob))
+  }
+  if (percent > 0){
+  if (augment == "add"){ #if the assemblage is to be added to
+    add_num<-round(percent*size) #determine what that is based on the initial size
+    if (criteria == "none") { #if there is no selection criteria...
+      adds<-sample(c(1:length(assemblage[,1])),add_num,replace = TRUE) #select random row numbers
+      adds<-assemblage[adds,]
+      assemblage<-rbind(assemblage,adds) #append them
+    }
+    if (criteria == "length") { #if selecting by overall length...
+      assemblage<-assemblage[order(assemblage$Length,decreasing = TRUE),] #order by decreasing length
+      adds<-assemblage[1:add_num,] #subset the topmost to the add number
+      assemblage<-rbind(assemblage,adds) #append them
+    }
+    if (criteria == "flake_only") { #if selecting only flakes...
+      flakes<-which(assemblage$FlakeClass == "flake") #determine which rows have flakes
+      smp<-sample(flakes,add_num,replace = TRUE) #select random flake rows
+      adds<-assemblage[smp,] #create a subset offlakes
+      assemblage<-rbind(assemblage,adds) #append them
+    }
+    if (criteria == "flake_long") { #if selecting only flakes...
+      cores<-which(assemblage$FlakeClass == "core") #determine which rows have flakes
+      cores_add<-assemblage[cores,] #find all the cores
+      assemblage<-assemblage[-cores,] #remove them
+      assemblage<-assemblage[order(assemblage$Length,decreasing = TRUE),] #order by decreasing length
+      adds<-assemblage[1:add_num,]#subset the topmost to the add number
+      assemblage<-rbind(assemblage,adds) #append them
+      assemblage<-rbind(assemblage,cores_add) #reappend the cores
+    }
+    if (criteria == "cortical") { #if selecting by maximum cortical surface
+      assemblage<-assemblage[order(assemblage$CSA,decreasing = TRUE),] #order by decreasing CSA
+      adds<-assemblage[1:add_num,]#subset the topmost to the add number
+      assemblage<-rbind(assemblage,adds) #append them
+    }
+    if (criteria == "volume") { #if selecting by maximum cortical surface
+      assemblage<-assemblage[order(assemblage$Volume,decreasing = TRUE),] #order by decreasing Volume
+      adds<-assemblage[1:add_num,]#subset the topmost to the add number
+      assemblage<-rbind(assemblage,adds) #append them
+    }
+    if (criteria == "surfvol") { #if selecting by maximum cortical surface
+      assemblage$surfvol<-assemblage$SurfaceArea/assemblage$Volume
+      assemblage<-assemblage[order(assemblage$surfvol,decreasing = TRUE),]
+      adds<-assemblage[1:add_num,] #subset the topmost to the add number
+      assemblage<-rbind(assemblage,adds) #append them
+    }
+  }
+  
+  if (augment == "remove"){ #if there is some removal amount
+    remove_num<-round(percent*size) #determine what that is based on the initial size
+    if (criteria == "none") { #if there is no selection criteria...
+      removals<-sample(c(1:length(assemblage[,1])),remove_num,replace = FALSE) #select random rows
+      assemblage<-assemblage[-removals,] #remove them
+    }
+    if (criteria == "length") { #if selecting by overall length...
+      assemblage<-assemblage[order(assemblage$Length,decreasing = TRUE),] #order by decreasing length
+      assemblage<-assemblage[remove_num:length(assemblage[,1]),] #remove topmost to the removal number
+    }
+    if (criteria == "flake_only") { #if selecting only flakes...
+      flakes<-which(assemblage$FlakeClass == "flake") #determine which rows have flakes
+      removals<-sample(flakes,remove_num,replace = FALSE) #select random flake rows
+      assemblage<-assemblage[-removals,] #remove them
+    }
+    if (criteria == "flake_long") { #if selecting only flakes...
+      cores<-which(assemblage$FlakeClass == "core") #determine which rows have flakes
+      cores_add<-assemblage[cores,]
+      assemblage<-assemblage[-cores,]
+      assemblage<-assemblage[order(assemblage$Length,decreasing = TRUE),] #order by decreasing length
+      assemblage<-assemblage[remove_num:length(assemblage[,1]),]
+      assemblage<-rbind(assemblage,cores_add)
+    }
+    if (criteria == "cortical") { #if selecting by maximum cortical surface
+      assemblage<-assemblage[order(assemblage$CSA,decreasing = TRUE),] #order by decreasing CSA
+      assemblage<-assemblage[remove_num:length(assemblage[,1]),] #remove topmost to the removal number
+    }
+      if (criteria == "volume") { #if selecting by maximum cortical surface
+      assemblage<-assemblage[order(assemblage$Volume,decreasing = TRUE),] #order by decreasing Volume
+      assemblage<-assemblage[remove_num:length(assemblage[,1]),] #remove topmost to the removal number
+    }
+    if (criteria == "surfvol") { #if selecting by maximum cortical surface
+      assemblage$surfvol<-assemblage$SurfaceArea/assemblage$Volume
+      assemblage<-assemblage[order(assemblage$surfvol,decreasing = TRUE),] #order by decreasing CSA
+      assemblage<-assemblage[remove_num:length(assemblage[,1]),] #remove topmost to the removal number
+    }
+  }
+  }
+  
+  assemblage #report the resulant assemblage as dataframe
+}
+
+#Function to get an average S value from lens clock readings
+#data = dataframe of fragment characteristics from 2A
+#s_reads = dataframe of corresponding fragment lens clock readings from s2_frag_s
+#readings = integer, number of fragments to use in mean S calculation (default 100)
+assemblageS<-function(data,s_reads,readings){
+  vals<-data$UNID #Get all IDs from the individual artifacts in the simulated assemblage
+  uvals<-sort(unique(vals)) #Get the unique ID numbers from the same artifacts
+  counts<-as.numeric(table(vals)) #get the count of each instance of the unique IDs
+  svals<-c() #empty list to record lens clock readings from sampled artifacts
+  for (i in c(1:length(uvals))){ #for each entry in the unique values...
+    sv<-subset(s_reads,UNID == uvals[i]) #subset the s readings data for that artifact
+    svals<-append(svals,rep(sv$S,counts[i])) #append s readings to the list
+  }
+  if (length(svals)>=readings){
+  reads<-sample(svals,readings,replace = FALSE) #sample the list from the number of readings
+  }
+  else {
+    reads<-sample(svals,readings,replace = TRUE) #sample the list from the number of readings
+  }
+  S<-mean(reads) #take the mean of the sample
+  Y<-s_reads[1,5] 
+  c(S,Y) #report vector containing S and Y
+}
+
+#Function to calculate theoretical nodule radius, surface area, and volume from S value
+#data = dataframe of fragment characteristics from 2A
+#sy = Vector of S and Y values obtained from 2B
+theo_nod<-function(sy){
+  r<-(sy[2]^2)/(2*sy[1])+(sy[1]/2) #calculate theoretical nodule radius from S and Y
+  theo_sa<-4*pi*r^2 #calculate theoretical nodule surface area
+  theo_vol<-((4/3)*pi*r^3)/1000 #calculate theoreitical nodule volume
+  c(r,theo_sa,theo_vol) #report vector of theoretical radius, surface area, and volume
+}
+
+#Using curvature-derived dimensions
+nod_char_s<-function(data,cobbles){
+  vals<-data$CobbleID #Get all IDs from the individual cobblesin the simulated assemblage
+  uvals<-sort(unique(vals)) #Get the unique ID numbers from the same artifacts
+  counts<-as.numeric(table(vals)) #Get counts of each ID number
+  a_rads<-c() #Empty list to record cobble radii
+  a_sas<-c() #Empty list to record cobble surface areas
+  a_vols<-c() #Empty list to record cobble volumes
+  j<-1 #Iteration counter
+  for (i in uvals){ #for each entry in the unique values...
+    #sub<-subset(cobbles,CobbleID == uvals[i]) #subset the s readings data for that artifact
+    a_rads<-append(a_rads,rep(cobbles[i,13],counts[j])) #add radii to 
+    a_sas<-append(a_sas,rep(cobbles[i,18],counts[j]))#append s readings to the list
+    a_vols<-append(a_vols,rep((((4/3)*pi*cobbles[i,13]^3)/1000),counts[j]))
+    j<-j+1 #Update counter
+  }
+  c(mean(a_rads),mean(a_sas),mean(a_vols))
+}
+
+cortexratioS<-function(data,sy){
+  assem_csa<-sum(data[,11]) #Get sum of cortical surface area from simulated assemblage
+  assem_vol<-sum(data[,14]) #Get sum of volume from simulated assemblage
+  r<-(sy[2]^2)/(2*sy[1])+(sy[1]/2) #calculate theoretical nodule radius from S and Y
+  theo_sa<-4*pi*r^2 #calculate theoretical nodule surface area
+  theo_vol<-((4/3)*pi*r^3)/1000 #calculate theoreitical nodule volume
+  exp_csa<-(assem_vol/theo_vol) * theo_sa #get expected cortical surface area
+  assem_csa/exp_csa #report cortex ratio
+}
+```
+
+#Step 6: Difference from "complete" assemblage using experimental data (Fig 3)
+```{r}
+#This method to assess statistical confidence in cortex ratios comes from
+
+# Lin SCH, McPherron SP, Dibble HL (2015) Establishing statistical confidence in Cortex Ratios within and among #lithic assemblages: a case study of the Middle Paleolithic of southwestern France. Journal of Archaeological Science #59:89–109. https://doi.org/10.1016/j.jas.2015.04.004
+
+
+#Function to simulate assemblage generation
+
+#The following function originally comes from 
+#Douglass M, Davies B, Braun DR, et al (2021) Deriving original nodule size of lithic reduction sets from cortical #curvature: An application to monitor stone artifact transport from bipolar reduction. Journal of Archaeological #Science: Reports 35:102671. https://doi.org/10.1016/j.jasrep.2020.102671
+
+#The original application assessed how lens clock-derived estimates of original nodule size from fragments compared to estimates derived from axial measurements on the whole cobbles prior to reduction. Here, it is being used to generate the simulate 10000 "complete" assemblages from experimental data and calculate cortex ratios using the lens clock method, and then compare this to the observed values.
+
+#SC pre 3000
+
+frag_nums<-c(100) #number of fragments to use in comparison
+vals<-hrq_frag$CobbleID #all cobble IDs
+cobbles<-unique(hrq_frag_s$COBBLE_ID) #unique cobble ids
+counts<-as.numeric(table(vals)) #counts of each cobble in assemblage
+assemblage_size<-length(sc_pre3000[,1]) #size of the initial 
+
+#These parameters determine whether any artefacts are added or removed after generation. Normally, the augment<-remove setting would remove artefacts based on the select_criteria (here set to none, which would remove at random). But since the select_percent parameter is 0, no artefacts are actually removed, producing a null "whole" assemblage. 
+augment<-"remove" 
+select_criteria<-c("none")
+select_percent<-c(0)
+
+sim<-c() #Empty vector for recording simulated theoretical nodule radii
+real<-c() #Empty vector for recording axial theoretical nodule radii
+cr<-c() #Empty vector for recording cortex ratios
+fr<-c() #Empty vector for recording fragment number (n)
+criteria<-c() #Empty vector for recording cortex ratios
+perc<-c() #Empty vector for recording the selection percentages
+aug<-c() #Empty vector for recording whether the assemblage is added to or subtracted from
+for (m in select_percent){ #For each selection percentage
+  for (n in select_criteria){ #For each selection criteria
+    for (i in frag_nums){ #For each number of fragments
+      
+      for (j in c(1:10000)){ #repeat 10k times
+        data<-makeAssemblage(hrq_frag,assemblage_size,augment,m,n) #make a simulated assemblage
+        sy<-assemblageS(data,hrq_frag_s,i) #get s y values
+        theo<-theo_nod(sy) #calculate theoretical nodule characteristics from lens clock
+        nod<-nod_char_s(data,hrq_cobbles) #calculate nodule characteristics from axial measures on the whole cobbles
+        sim<-append(sim,theo[1]) #append lens clock derived radii
+        real<-append(real,nod[1]) #append axial measure-derived radii
+        cr<-append(cr,cortexratioS(data,sy)) #append cortex ratios
+        perc<-append(perc,m) #append select_percent
+        aug<-append(aug,augment) #append augment 
+        fr<-append(fr,i) #append number of fragments used
+        criteria<-append(criteria,n) #append select_criteria 
+      }
+    }
+  }
+}
+perc<-perc*-1 #converts percentages to negative values for removal values > 0
+diffs<-sim/real #get the ratio of lens clock to axial derived radial estimates (1 = equal)
+ww<-tibble(aug,criteria,perc,fr,diffs,log(cr)) #make a table with the log of cortex ratios as the last column
+sc3ktrueval<-log(sc_cortex_ratios[1]) #get the log of the true cortex ratio value for the assemblage
+sc3kcrs<-ww$`log(cr)` #get simulated cortex ratio values
+sc3kp<-(length(sc3kcrs[sc3kcrs<=sc3ktrueval]) + length(sc3kcrs[sc3kcrs>=(sc3ktrueval*-1)]))/length(sc3kcrs)
+
+
+##SC post 1000 (see comments above for description of operations)
+
+frag_nums<-c(100) #number of fragments to use in comparison
+vals<-hrq_frag$CobbleID #all cobble IDs
+cobbles<-unique(hrq_frag_s$COBBLE_ID) #unique cobble ids
+counts<-as.numeric(table(vals)) #counts of each cobble in assemblage
+assemblage_size<-length(sc_post1000[,1]) #size of the initial 
+augment<-"remove"
+select_criteria<-c("none")
+select_percent<-c(0)
+
+sim<-c() #Empty vector for recording simulated theoretical nodule radii
+real<-c() #Empty vector for recording axial theoretical nodule radii
+cr<-c() #Empty vector for recording cortex ratios
+fr<-c() #Empty vector for recording fragment number (n)
+criteria<-c() #Empty vector for recording cortex ratios
+perc<-c() #Empty vector for recording the selection percentages
+aug<-c() #Empty vector for recording whether the assemblage is added to or subtracted from
+for (m in select_percent){ #For each selection percentage
+  for (n in select_criteria){ #For each selection criteria
+    for (i in frag_nums){ #For each number of fragments
+      
+      for (j in c(1:10000)){ #repeat 10k times
+        data<-makeAssemblage(hrq_frag,assemblage_size,augment,m,n) #make a simulated assemblage
+        sy<-assemblageS(data,hrq_frag_s,i) #get s y values
+        theo<-theo_nod(sy) #calculate theoretical nodule characteristics from lens clock
+        nod<-nod_char_s(data,hrq_cobbles) #calculate nodule characteristics from axial measures on the whole cobbles
+        sim<-append(sim,theo[1])
+        real<-append(real,nod[1])
+        cr<-append(cr,cortexratioS(data,sy))
+        perc<-append(perc,m)
+        aug<-append(aug,augment)
+        fr<-append(fr,i)
+        criteria<-append(criteria,n)
+      }
+    }
+  }
+}
+perc<-perc*-1 #convert percentages to negative values for removal
+diffs<-sim/real #get the ratio of lens clock to axial derived radial estimates (1 = equal)
+ww<-tibble(aug,criteria,perc,fr,diffs,log(cr)) #make a table with the log of cortex ratios as the last column
+sctoptrueval<-log(sc_cortex_ratios[2]) #get the log of the true cortex ratio value for the assemblage
+sctopcrs<-ww$`log(cr)`
+sctopp<-(length(sctopcrs[sctopcrs<=sctoptrueval]) + length(sctopcrs[sctopcrs>=(sctoptrueval*-1)]))/length(sctopcrs)
+
+#plot as histograms with vertical ablines for observed values
+par(mfrow=c(2,1))
+hist(sctopcrs,xlim=c(-1,1),xlab="Log Cortex Ratio",main="Spring Cave <1k")
+abline(v=sctoptrueval,lty=2)
+abline(v=sctoptrueval*-1,lty=2)
+
+hist(sc3kcrs,xlim=c(-1,1),xlab="Log Cortex Ratio",main="Spring Cave >3k")
+abline(v=sc3ktrueval,lty=2)
+abline(v=sc3ktrueval*-1,lty=2)
+
+```
+
+
+#Step 7: Layer difference assessment Spring Cave (Fig 4)
+```{r}
+#This method to assess statistical confidence in cortex ratios comes from
+
+# Lin SCH, McPherron SP, Dibble HL (2015) Establishing statistical confidence in Cortex Ratios within and among #lithic assemblages: a case study of the Middle Paleolithic of southwestern France. Journal of Archaeological Science #59:89–109. https://doi.org/10.1016/j.jas.2015.04.004
+
+truediff0<-abs(sc_cortex_ratios[1]-sc_cortex_ratios[2]) #get actual difference between layers
+diffs0<-c() #empty vector to track difference for simulated assemblages
+sc_all<-rbind(sc_pre3000,sc_post1000) #combine assemblages
+reduce3k<-length(sc_pre3000[,1]) #get size of pre3k assemblage
+total<-length(sc_all[,1]) #get the size of the combined assemblage
+for (i in c(1:10000)){ #repeat 10k times
+  ind<-sample(c(1:total),total-reduce3k,replace=FALSE) #pick a random sample of indices from the combined assemblage 
+  #equal to the size of the pre3k assemblage
+  assemblage1<-sc_all[ind,] #make those indices one simulated assemblage
+  assemblage2<-sc_all[-ind,] #make the rest a second assemblage
+  
+  #calculate cortex ratios for the first assemblage
+  sumweight1<-sum(assemblage1$WEIGHT,na.rm=TRUE)
+  assem_vol1<-sumweight1/2.65
+  exp_csa1<-(assem_vol1/sc_av_nod_vol)*sc_av_nod_csa
+  assem_csa1<-sum((assemblage1$MAXLENGTH*assemblage1$MAXWIDTH)*(assemblage1$CORTEX/100))
+  cr1<-assem_csa1/exp_csa1
+  
+  #calculate cortex ratios for the second assemblage
+   sumweight2<-sum(assemblage2$WEIGHT,na.rm=TRUE)
+  assem_vol2<-sumweight2/2.65
+  exp_csa2<-(assem_vol2/sc_av_nod_vol)*sc_av_nod_csa
+  assem_csa2<-sum((assemblage2$MAXLENGTH*assemblage2$MAXWIDTH)*(assemblage2$CORTEX/100))
+  cr2<-assem_csa2/exp_csa2
+  
+  #append the difference in cortex ratios
+  diffs0<-append(diffs0,(cr1-cr2))
+}
+
+#plot with vertical ablines showing difference observed between layers
+hist(diffs0,main="Spring Cave >3k vs <1k",xlab="Cortex Ratio Difference",xlim=c(-1,1),ylim=c(0,2500))
+abline(v=truediff0,lty=2)
+abline(v=(truediff0*-1),lty=2)
+text(0.7,2000,paste("p=<0.001",sep=""))
+text(0.7,2200,paste("diff=",round(truediff0,2),sep=""))
+
+```
+
